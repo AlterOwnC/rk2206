@@ -1,1 +1,0 @@
-../../../services/safwk/include/system_ability_connection_callback.h

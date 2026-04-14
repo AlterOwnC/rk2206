@@ -1,1 +1,0 @@
-../../../services/safwk/include/connection_handler.h

@@ -1,3 +1,0 @@
-[compile exit status]:1
-[compile console output]:
-[Error] ./27_include_invalid_file_ei/case.hcs:1:19: include invalid file: 'bar.hcs'

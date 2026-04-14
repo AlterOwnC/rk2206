@@ -1,1 +1,0 @@
-device/rockchip/tools/linux/flash.py
