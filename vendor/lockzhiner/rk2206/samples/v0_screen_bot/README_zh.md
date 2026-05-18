@@ -1,546 +1,155 @@
-# 小凌派-RK2206开发板基础外设开发——LCD液晶屏显示
+# 小凌派 Screen Bot — 智能宠物陪伴机器人
 
-本示例将演示如何在小凌派-RK2206开发板上LCD液晶屏显示
-
-![小凌派-RK2206开发板](/vendor/lockzhiner/rk2206/docs/figures/lockzhiner-rk2206.jpg)
+基于小凌派 RK2206 开发板 + OpenHarmony 3.0 LTS 的智能宠物喂食与互动陪伴系统。集成 LCD 表情动画、语音控制、手机远程操控、云端 IoT 上报、自动环境调控等功能。
 
 ## 硬件资源
 
-硬件资源图如下所示：
-![2.4寸液晶模块硬件资源](/vendor/lockzhiner/rk2206/docs/figures/2.4inch_lcd/2.4inch_lcd_resource_map.jpg)
+| 硬件模块 | 通信接口 | GPIO / 功能引脚 |
+| :--- | :--- | :--- |
+| 2.4寸 LCD (ST7789V) | SPI0 | CS→PC0, CLK→PC1, MOSI→PC2, RES→PC3, DC→PA4 |
+| 四键 ADC 键盘 | SARADC (CH7) | PC7 (ADC 分压检测) |
+| 双轴舵机 (激光逗猫) | PWM0 / PWM1 | PB4 (X轴), PB5 (Y轴) |
+| 喂食直流电机 | PWM6 | PC6 |
+| 激光发射模块 | GPIO | PC4 (低电平触发) |
+| 水泵 (饮水循环) | GPIO | PB0 (低电平触发) |
+| 散热风扇 | GPIO | PB1 (低电平触发) |
+| DS3231 RTC 时钟 | I2C1 | PB6 (SDA), PB7 (SCL) |
+| 语音识别模块 | UART2 | PB2 (TX), PB3 (RX), 115200bps |
+| Wi-Fi 联网 | STA 模式 | 板载 Wi-Fi |
 
-## 硬件接口说明
+## 功能架构
 
-引脚名称开发者可在硬件资源图中查看，也可在2.4寸液晶模块背面查看。
-
-| 引脚名称 | 功能描述 |
-| :--- | :------- | 
-| D/C | 指令/数据选择端，L:指令，H:数据 |
-| RESET | 复位信号线，低电平有效 | 
-| SPI_MOSI | SPI数据输入信号线 | 
-| SPI_CLK  | SPI时钟信号线 | 
-| SPI_CS | SPI片选信号线，低电平有效 | 
-| GND |电源地引脚 | 
-| 5V | 5V电源输入引脚 |
-
-## 硬件设计
-
-硬件电路如下图所示：
-![2.4寸液晶模块硬件电路图](/vendor/lockzhiner/rk2206/docs/figures/2.4inch_lcd/lz_hm_2.4inch_lcd_sch.jpg)
-
-### 硬件连接
-
-安装图如下所示：
-![2.4寸液晶模块硬件连接图](/vendor/lockzhiner/rk2206/docs/figures/2.4inch_lcd/2.4inch_lcd_connection_diagram.jpg)
-
-## 程序设计
-
-### API分析
-
-**头文件**
-
-```r
-//vendor/lockzhiner/rk2206/samples/b4_lcd/include/lcd.h
+```
+┌────────────────────────────────────────────────────────┐
+│                    main (APP_FEATURE_INIT)              │
+│                         │                              │
+│     ┌───────────────────┼───────────────────────┐      │
+│     ▼                   ▼                       ▼      │
+│  system_sync_init  创建 6 个 RTOS 线程         自动环境  │
+│  (互斥锁/队列/事件)                             调控    │
+│                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐     │
+│  │ lcd_ui   │  │ adc_key  │  │ rtc_task         │     │
+│  │ (主循环) │  │ (按键扫描)│  │ (RTC读写+同步)   │     │
+│  │ prio=24  │  │ prio=23  │  │ prio=25          │     │
+│  └────┬─────┘  └──────────┘  └──────────────────┘     │
+│       │  消费命令队列 (g_cmd_queue)                     │
+│  ┌────┴─────────────────────────────────────────┐      │
+│  │  menu_ui    eyes_emotion    硬件动作执行      │      │
+│  │  多级菜单   表情动画引擎     servo/motor/GPIO  │      │
+│  └──────────────────────────────────────────────┘      │
+│                                                         │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │
+│  │ udp_server │  │voice_uart  │  │ mqtt_cloud     │    │
+│  │ (WiFi UDP) │  │(语音模块)  │  │ (华为IoTDA上报) │    │
+│  │ prio=6     │  │ prio=24    │  │ prio=7         │    │
+│  └─────┬──────┘  └─────┬──────┘  └───────┬────────┘    │
+│        │               │                  │             │
+│        └───────────────┼──────────────────┘             │
+│                        ▼                                │
+│              cmd_send() → 命令队列 → cmd_recv()          │
+│               (生产者)              (消费者: lcd_ui)     │
+└────────────────────────────────────────────────────────┘
 ```
 
-#### lcd_init()
+## 线程分工
 
-```c
-unsigned int lcd_init();
+| 线程名 | 优先级 | 栈大小 | 功能 |
+| :--- | :--- | :--- | :--- |
+| `lcd_ui` | 24 | 20KB | 主循环：驱动表情动画、菜单交互、处理命令队列、自动环境调控、定时喂食 |
+| `adc_key` | 23 | 2KB | 20ms 周期扫描 ADC 电压，识别四个按键并消抖 |
+| `rtc_task` | 25 | 2KB | DS3231 读写、接收 UI 端的时间同步事件并写入硬件 |
+| `udp_server_task` | 6 | 10KB | WiFi UDP 服务器 (端口6666)，接收传感器 JSON 数据并推入命令队列 |
+| `voice_uart_task` | 24 | 4KB | UART2 接收语音模块二进制指令，按协议解析后推入命令队列 |
+| `mqtt_cloud` | 7 | 12KB | 连接华为 IoTDA，每6秒上报传感器数据，接收云端下发指令 |
+
+## UI 页面树
+
+```
+PAGE_IDLE (待机动画)
+  ├─ 灵动电子眼随机动画 (看左/看右/眨眼/彩蛋连招)
+  ├─ 状态栏: 日期时间 + WiFi 状态
+  └─ 按任意键 → PAGE_MAIN_MENU
+
+PAGE_CAT_MODE (逗猫模式)
+  ├─ 双轴舵机控制激光红点在限定区域随机运动
+  ├─ 屏幕眼神实时跟踪激光位置
+  ├─ 三种行为: 装死(20%) / 试探抖动(40%) / 突进跳跃(40%)
+  └─ 按任意键 → PAGE_MAIN_MENU
+
+PAGE_MAIN_MENU (主菜单)
+  ├─ Feed Now       → PAGE_SUB_FEED_AMT  (喂食份量选择)
+  ├─ Water & Fan    → PAGE_SUB_DEVICES   (水泵/风扇手动控制)
+  ├─ Schedules      → PAGE_SUB_SCHEDULE  (5 组定时喂食计划)
+  ├─ Interactive    → PAGE_CAT_MODE      (逗猫模式-本地)
+  ├─ Sensor Data    → PAGE_SUB_ENV       (温湿度/重量/水位实时显示)
+  └─ Settings       → PAGE_SUB_SETTINGS  (系统时间设置与同步)
+
+PAGE_SUB_FEEDING (喂食执行)
+  ├─ 8 帧喂食专属动画
+  ├─ 实时倒计时显示
+  └─ 倒计时结束/按键 → PAGE_MAIN_MENU
 ```
 
-**描述：**
+## 多模态控制通道
 
-lcd液晶屏设备初始化。
+| 控制通道 | 协议 | 触发方式 | 可执行指令 |
+| :--- | :--- | :--- | :--- |
+| 本地按键 | ADC | 4 键导航 | 全功能菜单操作 |
+| 语音模块 | UART 二进制 | `06 01`/`02 01` 等 | 查询温湿度/时间，喂食/逗猫/风扇 |
+| 手机 APP (UDP) | JSON over WiFi | `"temperature":28,...` | 传感器数据推送、逗猫启停 |
+| 华为云 IoTDA | MQTT | 云端下发命令 | `motor`/`laser` 指令 |
 
-**参数：**
+## 远程逗猫安全机制
 
-无
+本地按键进入逗猫模式时标记 `remote_cat_mode=0`，云端下发的关闭指令无法中断本地触发的逗猫模式；手机远程开启的逗猫模式 (`remote_cat_mode=1`) 则允许云端关闭。防止宠物在互动中被远程误关。
 
-**返回值：**
+## 自动环境调控
 
-返回0为成功，反之为失败
+- **温度 ≥ 28°C** → 自动开启散热风扇；温度降至 27°C 以下时关闭
+- **水位 ≤ 20%** → 自动开启循环水泵；水位升至 80% 以上时关闭
 
-#### lcd_deinit()
+## 定时喂食计划
 
-```c
-unsigned int lcd_deinit();
+支持 5 组定时计划，每组可配置：
+- 使能/禁用
+- 时间（时:分）
+- 喂食份量（1~3 份）
+
+到达设定时间时自动触发喂食，倒计时结束后返回待机画面。
+
+## 编译配置
+
+修改 `vendor/lockzhiner/rk2206/sample/BUILD.gn` 添加：
+
+```gn
+"./v0_screen_bot:screen_bot"
 ```
 
-**描述：**
+## 关键技术要点
 
-lcd液晶屏设备注销。
+- **LCD 渲染优化**: SPI 50MHz 速率，行缓冲 + DMA 批量直推，填充/图片渲染达到流畅帧率
+- **中文字库**: 片内点阵字库支持 12/16/24/32 号字体，UTF-8 编码自动转索引码
+- **线程安全**: 传感器变量受 `g_sensor_mutex` 保护，RTC 时间受 `g_rtc_mutex` 保护，跨线程控制通过 `g_cmd_queue` 消息队列解耦
+- **交互打断**: `delay_with_break()` 函数在动画延时期间实时检测按键和页面切换，实现即时响应
 
-**参数：**
+## 引脚资源总览
 
-无
-
-**返回值：**
-
-返回0为成功，反之为失败
-
-#### lcd_fill()
-
-```c
-void lcd_fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color);
 ```
-
-**描述：**
-
-lcd液晶屏指定区域填充颜色。
-
-**参数：**
-
-| 名字  | 描述                  |
-| :---- | :-------------------- |
-| xsta  | 指定区域的起始点X坐标 |
-| ysta  | 指定区域的起始点Y坐标 |
-| xend  | 指定区域的结束点X坐标 |
-| yend  | 指定区域的结束点Y坐标 |
-| color | 指定区域的颜色        |
-
-**返回值：**
-
-无
-
-#### lcd_draw_point()
-
-```c
-void lcd_draw_point(uint16_t x, uint16_t y, uint16_t color);
+GPIO0_PA4  → LCD DC (指令/数据选择)
+GPIO0_PB0  → 水泵继电器 (低电平吸合)
+GPIO0_PB1  → 风扇继电器 (低电平吸合)
+GPIO0_PB2  → UART2 TX (语音模块)
+GPIO0_PB3  → UART2 RX (语音模块)
+GPIO0_PB4  → PWM0 (舵机X轴)
+GPIO0_PB5  → PWM1 (舵机Y轴)
+GPIO0_PB6  → I2C1 SDA (DS3231)
+GPIO0_PB7  → I2C1 SCL (DS3231)
+GPIO0_PC0  → SPI0 CS  (LCD)
+GPIO0_PC1  → SPI0 CLK (LCD)
+GPIO0_PC2  → SPI0 MOSI (LCD)
+GPIO0_PC3  → LCD RES (复位)
+GPIO0_PC4  → 激光模块 (低电平亮)
+GPIO0_PC6  → PWM6 (喂食电机)
+GPIO0_PC7  → SARADC CH7 (四键键盘)
 ```
-
-**描述：**
-
-lcd液晶屏指定位置画一个点。
-
-**参数：**
-
-| 名字  | 描述          |
-| :---- | :------------ |
-| x     | 指定点的X坐标 |
-| y     | 指定点的Y坐标 |
-| color | 指定点的颜色  |
-
-**返回值：**
-
-无
-
-#### lcd_draw_line()
-
-```c
-void lcd_draw_line(uint16_t x1, uint16_t y1, 
-                uint16_t x2, uint16_t y2, 
-                uint16_t color);
-```
-
-**描述：**
-
-lcd液晶屏指定位置画一条线。
-
-**参数：**
-
-| 名字  | 描述                |
-| :---- | :------------------ |
-| x1    | 指定线的起始点X坐标 |
-| y1    | 指定线的起始点Y坐标 |
-| x2    | 指定线的结束点X坐标 |
-| y2    | 指定线的结束点Y坐标 |
-| color | 指定线的颜色        |
-
-**返回值：**
-
-无
-
-#### lcd_draw_rectangle()
-
-```c
-void lcd_draw_rectangle(uint16_t x1, uint16_t y1, 
-                uint16_t x2, uint16_t y2, 
-                uint16_t color);
-```
-
-**描述：**
-
-lcd液晶屏指定位置画矩形。
-
-**参数：**
-
-| 名字  | 描述                  |
-| :---- | :-------------------- |
-| x1    | 指定矩形的起始点X坐标 |
-| y1    | 指定矩形的起始点Y坐标 |
-| x2    | 指定矩形的结束点X坐标 |
-| y2    | 指定矩形的结束点Y坐标 |
-| color | 指定矩形的颜色        |
-
-**返回值：**
-
-无
-
-#### lcd_draw_circle()
-
-```c
-void lcd_draw_circle(uint16_t x0, uint16_t y0, uint8_t r, uint16_t color);
-```
-
-**描述：**
-
-lcd液晶屏指定位置画圆。
-
-**参数：**
-
-| 名字  | 描述                |
-| :---- | :------------------ |
-| x0    | 指定圆的中心点X坐标 |
-| y0    | 指定圆的中心点Y坐标 |
-| r     | 指定圆的半径        |
-| color | 指定圆的颜色        |
-
-**返回值：**
-
-无
-
-#### lcd_show_chinese()
-
-```c
-void lcd_show_chinese(uint16_t x, 
-                    uint16_t y, 
-                    uint8_t *s, 
-                    uint16_t fc, 
-                    uint16_t bc, 
-                    uint8_t sizey, 
-                    uint8_t mode);
-```
-
-**描述：**
-
-lcd液晶屏显示汉字串。
-
-**参数：**
-
-| 名字  | 描述                          |
-| :---- | :---------------------------- |
-| x     | 指定汉字串的起始位置X坐标     |
-| y     | 指定汉字串的起始位置X坐标     |
-| s     | 指定汉字串（该汉字串为utf-8） |
-| fc    | 字的颜色                      |
-| bc    | 字的背景色                    |
-| sizey | 字号，可选：12、16、24、32    |
-| mode  | 0为非叠加模式；1为叠加模式    |
-
-**返回值：**
-
-无
-
-#### lcd_show_char()
-
-```c
-void lcd_show_char(uint16_t x, 
-                    uint16_t y, 
-                    uint8_t *s, 
-                    uint16_t fc, 
-                    uint16_t bc, 
-                    uint8_t sizey, 
-                    uint8_t mode);
-```
-
-**描述：**
-
-lcd液晶屏显示一个字符。
-
-**参数：**
-
-| 名字  | 描述                       |
-| :---- | :------------------------- |
-| x     | 指定汉字串的起始位置X坐标  |
-| y     | 指定汉字串的起始位置X坐标  |
-| s     | 指定一个ASCII字符          |
-| fc    | 字的颜色                   |
-| bc    | 字的背景色                 |
-| sizey | 字号，可选：12、16、24、32 |
-| mode  | 0为非叠加模式；1为叠加模式 |
-
-**返回值：**
-
-无
-
-#### lcd_show_string()
-
-```c
-void lcd_show_string(uint16_t x, 
-                    uint16_t y, 
-                    const uint8_t *p, 
-                    uint16_t fc, 
-                    uint16_t bc, uint8_t sizey, uint8_t mode);
-```
-
-**描述：**
-
-lcd液晶屏显示字符串。
-
-**参数：**
-
-| 名字  | 描述                       |
-| :---- | :------------------------- |
-| x     | 指定汉字串的起始位置X坐标  |
-| y     | 指定汉字串的起始位置X坐标  |
-| p     | 指定一个英文字符串         |
-| fc    | 字的颜色                   |
-| bc    | 字的背景色                 |
-| sizey | 字号，可选：12、16、24、32 |
-| mode  | 0为非叠加模式；1为叠加模式 |
-
-**返回值：**
-
-无
-
-#### lcd_show_int_num()
-
-```c
-void lcd_show_int_num(uint16_t x, uint16_t y, uint16_t num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey);
-```
-
-**描述：**
-
-lcd液晶屏显示一个整数。
-
-**参数：**
-
-| 名字  | 描述                       |
-| :---- | :------------------------- |
-| x     | 指定汉字串的起始位置X坐标  |
-| y     | 指定汉字串的起始位置X坐标  |
-| p     | 指定一个英文字符串         |
-| fc    | 字的颜色                   |
-| bc    | 字的背景色                 |
-| sizey | 字号，可选：12、16、24、32 |
-| mode  | 0为非叠加模式；1为叠加模式 |
-
-**返回值：**
-
-无
-
-#### lcd_show_float_num1()
-
-```c
-void lcd_show_float_num1(uint16_t x, uint16_t y, float num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey);
-```
-
-**描述：**
-
-lcd液晶屏显示两位小数变量。
-
-**参数：**
-
-| 名字  | 描述                        |
-| :---- | :-------------------------- |
-| x     | 指定浮点变量的起始位置X坐标 |
-| y     | 指定浮点变量的起始位置X坐标 |
-| num   | 指定浮点变量                |
-| fc    | 字的颜色                    |
-| bc    | 字的背景色                  |
-| sizey | 字号，可选：12、16、24、32  |
-
-**返回值：**
-
-无
-
-#### lcd_show_picture()
-
-```c
-void lcd_show_picture(uint16_t x, uint16_t y, uint16_t length, uint16_t width, const uint8_t *pic);
-```
-
-**描述：**
-
-lcd液晶屏显示图片。
-
-**参数：**
-
-| 名字   | 描述                      |
-| :----- | :------------------------ |
-| x      | 指定浮图片的起始位置X坐标 |
-| y      | 指定浮图片的起始位置X坐标 |
-| length | 指定图片的长度            |
-| width  | 指定图片的宽度            |
-| pic    | 指定图片的内容            |
-
-**返回值：**
-
-无
-
-### LCD液晶屏
-
-LCD型号为ST7789V，采用SPI通信方式，数据传输协议如下：
-
-`4-Line Serial Interface => 16-bit/pixel(RGB 5-6-5-bit input)，65K-Color，3Ah="05h"`
-
-数据传输时序图如下：
-
-![](/vendor/lockzhiner/rk2206/docs/figures/LCD_ST7789V/ST7789V_数据传输模式.png "LCD数据传输时序图")
-
-LCD使用的是SPI协议，SPI_CS与GPIO0_PC0相连接，SPI_CLK与GPIO0_PC1相连接，SPI_MOSI与GPIO0_PC2相连接，RES与GPIO0_PC3相连接，DC与GPIO0_PC6相连接。
-
-### 初始化代码分析
-
-本程序可使用SPI或GPIO模拟SPI与LCD进行通信。以下我们主要对SPI与LCD进行通信进行代码分析。
-这部分代码为SPI初始化的代码。首先用 `SpiIoInit()` 函数将GPIO0_PC0复用为SPI0_CS0n_M1，GPIO0_PC1复用为SPI0_CLK_M1，GPIO0_PC2复用为SPI0_MOSI_M1。最后调用 `LzI2cInit()`函数初始化SPI0端口。
-
-```c
-if (SpiIoInit(m_spiBus) != LZ_HARDWARE_SUCCESS) {
-    printf("%s, %d: SpiIoInit failed!\n", __FILE__, __LINE__);
-    return __LINE__;
-}
-if (LzSpiInit(LCD_SPI_BUS, m_spiConf) != LZ_HARDWARE_SUCCESS) {
-    printf("%s, %d: LzSpiInit failed!\n", __FILE__, __LINE__);
-    return __LINE__;
-}
-```
-
-这部分代码为GPIO初始化的代码。首先用 `LzGpioInit()`函数将GPIO0_PC3初始化为GPIO引脚，然后用 `LzGpioSetDir()`将引脚设置为输出模式，最后调用 `LzGpioSetVal()`输出低电平。
-
-```c
-/* 初始化GPIO0_C3 */
-LzGpioInit(LCD_PIN_RES);
-LzGpioSetDir(LCD_PIN_RES, LZGPIO_DIR_OUT);
-LzGpioSetVal(LCD_PIN_RES, LZGPIO_LEVEL_HIGH);
-
-/* 初始化GPIO0_C6 */
-LzGpioInit(LCD_PIN_DC);
-LzGpioSetDir(LCD_PIN_DC, LZGPIO_DIR_OUT);
-LzGpioSetVal(LCD_PIN_DC, LZGPIO_LEVEL_LOW);
-```
-
-### 通过SPI往LCD屏幕写数据操作
-
-这部分的代码是向LCD写入数据，具体如下：
-
-```c
-LzSpiWrite(LCD_SPI_BUS, 0, &dat, 1);
-```
-
-### 配置ST7789V启动
-
-```c
-/* 重启lcd */
-LCD_RES_Clr();
-LOS_Msleep(100);
-LCD_RES_Set();
-LOS_Msleep(100);
-LOS_Msleep(500);
-lcd_wr_reg(0x11);
-/* 等待LCD 100ms */
-LOS_Msleep(100);
-/* 启动LCD配置，设置显示和颜色配置 */
-lcd_wr_reg(0X36);
-if (USE_HORIZONTAL == 0)
-{
-    lcd_wr_data8(0x00);
-}
-else if (USE_HORIZONTAL == 1)
-{
-    lcd_wr_data8(0xC0);
-}
-else if (USE_HORIZONTAL == 2)
-{
-    lcd_wr_data8(0x70);
-}
-else
-{
-    lcd_wr_data8(0xA0);
-}
-lcd_wr_reg(0X3A);
-lcd_wr_data8(0X05);
-/* ST7789S帧刷屏率设置 */
-lcd_wr_reg(0xb2);
-lcd_wr_data8(0x0c);
-lcd_wr_data8(0x0c);
-lcd_wr_data8(0x00);
-lcd_wr_data8(0x33);
-lcd_wr_data8(0x33);
-lcd_wr_reg(0xb7);
-lcd_wr_data8(0x35);
-/* ST7789S电源设置 */
-lcd_wr_reg(0xbb);
-lcd_wr_data8(0x35);
-lcd_wr_reg(0xc0);
-lcd_wr_data8(0x2c);
-lcd_wr_reg(0xc2);
-lcd_wr_data8(0x01);
-lcd_wr_reg(0xc3);
-lcd_wr_data8(0x13);
-lcd_wr_reg(0xc4);
-lcd_wr_data8(0x20);
-lcd_wr_reg(0xc6);
-lcd_wr_data8(0x0f);
-lcd_wr_reg(0xca);
-lcd_wr_data8(0x0f);
-lcd_wr_reg(0xc8);
-lcd_wr_data8(0x08);
-lcd_wr_reg(0x55);
-lcd_wr_data8(0x90);
-lcd_wr_reg(0xd0);
-lcd_wr_data8(0xa4);
-lcd_wr_data8(0xa1);
-/* ST7789S gamma设置 */
-lcd_wr_reg(0xe0);
-lcd_wr_data8(0xd0);
-lcd_wr_data8(0x00);
-lcd_wr_data8(0x06);
-lcd_wr_data8(0x09);
-lcd_wr_data8(0x0b);
-lcd_wr_data8(0x2a);
-lcd_wr_data8(0x3c);
-lcd_wr_data8(0x55);
-lcd_wr_data8(0x4b);
-lcd_wr_data8(0x08);
-lcd_wr_data8(0x16);
-lcd_wr_data8(0x14);
-lcd_wr_data8(0x19);
-lcd_wr_data8(0x20);
-lcd_wr_reg(0xe1);
-lcd_wr_data8(0xd0);
-lcd_wr_data8(0x00);
-lcd_wr_data8(0x06);
-lcd_wr_data8(0x09);
-lcd_wr_data8(0x0b);
-lcd_wr_data8(0x29);
-lcd_wr_data8(0x36);
-lcd_wr_data8(0x54);
-lcd_wr_data8(0x4b);
-lcd_wr_data8(0x0d);
-lcd_wr_data8(0x16);
-lcd_wr_data8(0x14);
-lcd_wr_data8(0x21);
-lcd_wr_data8(0x20);
-lcd_wr_reg(0x29);
-```
-
-这部分代码将ST7789V配置为 `4-Line Serial Interface => 16-bit/pixel(RGB 5-6-5-bit input)，65K-Color`
-
-## 编译调试
-
-### 修改 BUILD.gn 文件
-
-修改 `vendor\lockzhiner\rk2206\sample` 路径下 BUILD.gn 文件，指定 `lcd_example` 参与编译。
-
-```r
-"./b0_lcd:lcd_example",
-```
-
-修改 `device/lockzhiner/rk2206/sdk_liteos` 路径下 Makefile 文件，添加 `-llcd_example` 参与编译。
-
-```r
-hardware_LIBS = -lhal_iothardware -lhardware -llcd_example
-```
-
-### 运行结果
-
-示例代码编译烧录代码后，按下开发板的RESET按键，通过串口助手查看日志，并请使用带有LCD屏幕显示如下：
-
-```c
-************Lcd Example***********
-
-************Lcd Example***********
-```
-
