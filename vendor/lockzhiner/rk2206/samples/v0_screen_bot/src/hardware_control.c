@@ -41,7 +41,7 @@ void devices_init(void)
     DevIoInit(m_pump_io);
     LzGpioInit(PUMP_PIN);
     LzGpioSetDir(PUMP_PIN, LZGPIO_DIR_OUT);
-    LzGpioSetVal(PUMP_PIN, LZGPIO_LEVEL_HIGH); // 默认高电平(关)
+    LzGpioSetVal(PUMP_PIN, LZGPIO_LEVEL_LOW); // 默认低电平(关)
 
     // 3. 初始化风扇 (B1)
     DevIoInit(m_fan_io);
@@ -59,7 +59,7 @@ void laser_control(int on) {
 
 void pump_control(int on) {
     g_pump_state = on; // 同步记录状态
-    LzGpioSetVal(PUMP_PIN, on ? LZGPIO_LEVEL_LOW : LZGPIO_LEVEL_HIGH);
+    LzGpioSetVal(PUMP_PIN, on ? LZGPIO_LEVEL_HIGH : LZGPIO_LEVEL_LOW);
 }
 
 void fan_control(int on) {
